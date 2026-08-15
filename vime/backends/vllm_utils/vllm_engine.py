@@ -260,6 +260,12 @@ class VLLMEngine(RayActor):
         response.raise_for_status()
         return True
 
+    def update_weights_from_modelexpress(self, target_version: str):
+        return self._make_request(
+            "update_weights",
+            {"update_info": {"version": target_version}},
+        )
+
     def update_weights_from_tensor(
         self,
         *,
@@ -622,7 +628,9 @@ def _compute_server_args(
     ):
         kwargs["max_model_len"] = args.rollout_max_context_len
 
-    if args.colocate:
+    if getattr(args, "update_weight_transport", "nccl") == "modelexpress":
+        kwargs["weight_transfer_config"] = {"backend": "modelexpress"}
+    elif args.colocate:
         kwargs["weight_transfer_config"] = {"backend": "ipc"}
     else:
         kwargs["weight_transfer_config"] = {"backend": "nccl"}

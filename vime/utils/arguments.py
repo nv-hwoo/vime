@@ -145,14 +145,20 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--update-weight-transport",
-                choices=["nccl", "disk"],
+                choices=["nccl", "disk", "modelexpress"],
                 default="nccl",
                 help=(
-                    "Carrier for weight sync. In full mode, 'nccl' broadcasts chunks and "
-                    "'disk' writes a complete HF checkpoint under --update-weight-disk-dir "
-                    "before engines reload it. Delta mode is 'disk' only: each host applies the "
-                    "published deltas into its local checkpoint and reloads via update_weights_from_disk."
+                    "Carrier for weight sync. In full mode, 'nccl' broadcasts chunks, "
+                    "'disk' writes a complete HF checkpoint under --update-weight-disk-dir, and "
+                    "'modelexpress' uses the revision lifecycle configured by --modelexpress-config. "
+                    "Delta mode is 'disk' only."
                 ),
+            )
+            parser.add_argument(
+                "--modelexpress-config",
+                type=json.loads,
+                default={},
+                help="ModelExpress configuration as a JSON object.",
             )
             parser.add_argument(
                 "--release-train",
@@ -2028,6 +2034,38 @@ def vime_validate_args(args):
 
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if args.update_weight_transport == "modelexpress":
+        config = args.modelexpress_config
+        if not isinstance(config, dict):
+            raise ValueError("--modelexpress-config must be a JSON object")
+        required = {
+            "model_id": config.get("model_id"),
+            "catalog_endpoint": config.get("catalog_endpoint"),
+            "s3_bucket": config.get("s3_bucket"),
+            "preparation_cache_dir": config.get("preparation_cache_dir"),
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError("--modelexpress-config requires " + ", ".join(missing))
+        if args.rollout_external:
+            raise ValueError("ModelExpress does not support external rollout engines")
+        if args.release_train:
+            raise ValueError("ModelExpress does not support --release-train")
+        if getattr(args, "use_fault_tolerance", False):
+            raise ValueError("ModelExpress does not support rollout fault tolerance")
+        if getattr(args, "lora_rank", 0) > 0:
+            raise ValueError("ModelExpress does not support LoRA weight updates")
+        if str(config.get("initial_version", "0")) != "0":
+            raise ValueError("ModelExpress requires initial_version=0")
+        if float(config.get("ready_timeout_seconds", 600.0)) <= 0:
+            raise ValueError("ModelExpress ready_timeout_seconds must be positive")
+        if args.update_weight_disk_dir or args.update_weight_local_checkpoint_dir:
+            raise ValueError("ModelExpress does not use native disk weight-update directories")
+        if args.custom_update_weight_post_write_path:
+            raise ValueError("ModelExpress does not use --custom-update-weight-post-write-path")
+    elif args.modelexpress_config:
+        raise ValueError("--modelexpress-config requires --update-weight-transport=modelexpress")
 
     if getattr(args, "release_train", False):
         if args.train_backend != "megatron":
