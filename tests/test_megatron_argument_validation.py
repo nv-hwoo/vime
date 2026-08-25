@@ -331,7 +331,7 @@ def test_modelexpress_requires_its_stable_configuration(monkeypatch):
     module = load_vime_arguments_module(monkeypatch)
     args = make_vime_validate_args(update_weight_transport="modelexpress")
 
-    with pytest.raises(ValueError, match="modelexpress-config requires model_id"):
+    with pytest.raises(ValueError, match="modelexpress-config requires model_name"):
         module.vime_validate_args(args)
 
 
@@ -341,9 +341,10 @@ def test_modelexpress_does_not_require_native_disk_configuration(monkeypatch):
     args = make_vime_validate_args(
         update_weight_transport="modelexpress",
         modelexpress_config={
-            "model_id": "policy",
-            "catalog_endpoint": "dns:///catalog:50051",
-            "s3_bucket": "weights",
+            "model_name": "policy",
+            "server_url": "dns:///mx:50051",
+            "initial_base_version_id": "base-uid",
+            "s3_uri_prefix": "s3://weights/run/policy",
             "preparation_cache_dir": "/mxdelta/mxprep",
         },
     )
@@ -362,7 +363,7 @@ def test_modelexpress_uses_existing_transfer_selector_and_one_json_config(monkey
             "--update-weight-transport",
             "modelexpress",
             "--modelexpress-config",
-            '{"model_id":"policy","future_option":{"enabled":true}}',
+            '{"model_name":"policy","future_option":{"enabled":true}}',
             "--rollout-batch-size",
             "1",
         ]
@@ -370,11 +371,29 @@ def test_modelexpress_uses_existing_transfer_selector_and_one_json_config(monkey
 
     assert args.update_weight_transport == "modelexpress"
     assert args.modelexpress_config == {
-        "model_id": "policy",
+        "model_name": "policy",
         "future_option": {"enabled": True},
     }
     assert not hasattr(args, "update_weight_backend")
     assert not hasattr(args, "modelexpress_model_id")
+
+
+@pytest.mark.unit
+def test_modelexpress_requires_an_s3_uri_prefix(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(
+        update_weight_transport="modelexpress",
+        modelexpress_config={
+            "model_name": "policy",
+            "server_url": "dns:///mx:50051",
+            "initial_base_version_id": "base-uid",
+            "s3_uri_prefix": "weights/run/policy",
+            "preparation_cache_dir": "/mxdelta/mxprep",
+        },
+    )
+
+    with pytest.raises(ValueError, match="must use the s3:// scheme"):
+        module.vime_validate_args(args)
 
 
 @pytest.mark.unit

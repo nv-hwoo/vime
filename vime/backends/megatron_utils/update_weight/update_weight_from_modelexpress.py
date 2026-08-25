@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from time import perf_counter
 from typing import Any
 
 import ray
@@ -11,7 +11,6 @@ import torch.distributed as dist
 from megatron.core import mpu
 from ray.actor import ActorHandle
 
-from vime.utils.disk_delta import make_tensor_reader
 from vime.utils.distributed_utils import get_gloo_group
 
 from .update_weight_from_disk_delta import UpdateWeightFromDiskDelta
@@ -21,8 +20,17 @@ class ModelExpressUpdateError(RuntimeError):
     pass
 
 
+_UPDATE_PHASE_METRICS = (
+    "perf/mx_control_create_weight_version",
+    "perf/mx_stage_shard",
+    "perf/mx_publish_shard",
+    "perf/mx_publish_server",
+    "perf/mx_update_activate_time",
+)
+
+
 class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
-    """Vime publisher and vLLM weight-transfer lifecycle integration."""
+    """Publish canonical S3 deltas and update vLLM through ModelExpress."""
 
     def __init__(
         self,
@@ -31,7 +39,8 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         weights_getter: Callable[[], Mapping[str, torch.Tensor]],
         model_name: str,
         quantization_config: dict[str, int | str | list[str]] | None,
-        publisher=None,
+        control_client=None,
+        trainer_client=None,
     ) -> None:
         del weights_getter
         self.args = args
@@ -39,39 +48,61 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         self.model_name = model_name
         self.quantization_config = quantization_config
         self._config = dict(args.modelexpress_config)
-        self.weight_version = int(self._config.get("initial_version", "0"))
+        self.weight_version = int(self._config.get("initial_version", 0))
+        self._current_version_id = str(self._config["initial_base_version_id"])
+        self._pending_version_id: str | None = None
+        self._pending_published = False
+        self._pending_ready = False
         self.rollout_engines: Sequence[ActorHandle] | None = None
         self._connection_stale = False
         self._baseline_captured = False
-        self._metrics: dict[str, float] = {}
+        self._metrics: dict[str, int | float] = {}
 
-        if publisher is None:
-            from modelexpress.refit import Publisher, PublisherConfig, S3Config
+        from modelexpress_rl import (
+            ModelExpressControlClient,
+            ModelExpressTrainerClient,
+            ModelExpressTrainerConfig,
+            S3Config,
+            TrainerStagingMode,
+            WeightPayloadFormat,
+            WeightVersionRef,
+            WeightVersionState,
+        )
 
-            publisher = Publisher(
-                launch_checkpoint=vars(args)["hf_checkpoint"],
-                bucket_bytes=args.update_weight_buffer_size,
-                group=get_gloo_group(),
-            )
-            publisher.initialize(
-                PublisherConfig(
-                    model_id=self._config["model_id"],
-                    catalog_endpoint=self._config["catalog_endpoint"],
+        self._WeightPayloadFormat = WeightPayloadFormat
+        self._WeightVersionRef = WeightVersionRef
+        self._WeightVersionState = WeightVersionState
+        rpc_timeout_seconds = float(self._config.get("rpc_timeout_seconds", 30.0))
+
+        if trainer_client is None:
+            registration_ttl = self._config.get("registration_ttl_seconds")
+            trainer_client = ModelExpressTrainerClient.initialize(
+                ModelExpressTrainerConfig(
+                    model_name=self._config["model_name"],
+                    staging_mode=TrainerStagingMode.WRITE_TO_STORAGE,
+                    payload_format=WeightPayloadFormat.XOR_DELTA,
+                    server_url=self._config["server_url"],
+                    registration_ttl_seconds=(int(registration_ttl) if registration_ttl is not None else None),
+                    rpc_timeout_seconds=rpc_timeout_seconds,
+                    process_group=get_gloo_group(),
                     s3=S3Config(
-                        bucket=self._config["s3_bucket"],
-                        prefix=self._config.get("s3_prefix", ""),
-                        endpoint_url=self._config.get("s3_endpoint"),
+                        uri_prefix=self._config["s3_uri_prefix"],
+                        initial_base_version_id=self._current_version_id,
+                        launch_checkpoint=vars(args)["hf_checkpoint"],
+                        endpoint_url=self._config.get("s3_endpoint_url"),
+                        region_name=self._config.get("s3_region_name"),
                     ),
                 )
             )
-        self._publisher = publisher
-        self._catalog = publisher.catalog
-        self._control = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="modelexpress-control")
-            if dist.get_rank() == 0
-            else None
-        )
-        self._publisher.publish_version("0")
+        self._trainer = trainer_client
+
+        if dist.get_rank() == 0:
+            self._control = control_client or ModelExpressControlClient.connect(
+                server_url=self._config["server_url"],
+                rpc_timeout_seconds=rpc_timeout_seconds,
+            )
+        else:
+            self._control = None
 
     def is_rollout_engines_fresh(self) -> bool:
         return self.rollout_engines is not None and not self._connection_stale
@@ -92,95 +123,194 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         if self.rollout_engines == connected and not self._connection_stale:
             return
         self.rollout_engines = connected
-        self._connection_stale = False
+        self._connection_stale = True
         self._is_pp_src_rank = (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
         )
-        version = str(self.weight_version)
-        launch_pending = self._publisher.pending_version == version
-        if dist.get_rank() == 0:
-            init_info = {
-                "model_id": self._config["model_id"],
-                "catalog_endpoint": self._config["catalog_endpoint"],
-                "initial_version": version,
-                "preparation_cache_dir": self._config["preparation_cache_dir"],
-                "ready_timeout_seconds": float(self._config.get("ready_timeout_seconds", 600.0)),
-                "s3_endpoint_url": self._config.get("s3_endpoint"),
-            }
-            try:
-                ray.get(
-                    [
-                        engine.init_weight_transfer_engine.remote({"init_info": init_info})
-                        for engine in self.rollout_engines
-                    ]
-                )
-            except Exception as error:
-                raise ModelExpressUpdateError(f"vLLM ModelExpress initialization failed: {error}") from error
-            if launch_pending:
-                self._catalog.commit_revision(self._config["model_id"], version)
-        if launch_pending:
-            self._publisher.wait_for_commit(version)
+
+        registration_ttl = self._config.get("registration_ttl_seconds")
+        lease_ttl = self._config.get("lease_ttl_seconds")
+
+        init_info = {
+            "model_name": self._config["model_name"],
+            "server_url": self._config["server_url"],
+            "initial_base_version_id": self._current_version_id,
+            "launch_checkpoint": vars(self.args)["hf_checkpoint"],
+            "preparation_cache_dir": self._config["preparation_cache_dir"],
+            "s3_endpoint_url": self._config.get("s3_endpoint_url"),
+            "s3_region_name": self._config.get("s3_region_name"),
+            "registration_ttl_seconds": int(registration_ttl) if registration_ttl is not None else None,
+            "lease_ttl_seconds": int(lease_ttl) if lease_ttl is not None else None,
+            "max_transfer_attempts": int(self._config.get("max_transfer_attempts", 3)),
+            "rpc_timeout_seconds": float(self._config.get("rpc_timeout_seconds", 30.0)),
+        }
+
+        def initialize_engines():
+            ray.get([engine.init_weight_transfer_engine.remote({"init_info": init_info}) for engine in connected])
+
+        self._rank_zero_call(initialize_engines, "vLLM ModelExpress initialization failed")
+        self._connection_stale = False
 
     def disconnect_rollout_engines(self) -> None:
         self.rollout_engines = None
         self._connection_stale = True
 
-    def pop_metrics(self) -> dict[str, float]:
+    def pop_metrics(self) -> dict[str, int | float]:
         metrics, self._metrics = self._metrics, {}
         return metrics
+
+    def _rank_zero_call(self, action: Callable[[], Any], description: str) -> Any:
+        result = [None, None]
+        if dist.get_rank() == 0:
+            try:
+                result[0] = action()
+            except Exception as error:
+                result[1] = str(error)
+        dist.broadcast_object_list(result, src=0, group=get_gloo_group())
+        if result[1] is not None:
+            raise ModelExpressUpdateError(f"{description}: {result[1]}")
+        return result[0]
 
     @torch.no_grad()
     def update_weights(self) -> None:
         if not self._baseline_captured:
-            self._publisher.capture_baseline(
-                self._for_each_hf_bucket,
-                make_tensor_reader(vars(self.args)["hf_checkpoint"]),
-            )
+            self._trainer.prepare_delta_base(hf_tensor_iter=self._iter_hf_buckets())
             self._baseline_captured = True
             return
         if self.rollout_engines is None:
             raise ModelExpressUpdateError("rollout engines are not connected")
 
-        target_version = str(self.weight_version + 1)
-        self._publisher.publish_version(
-            target_version,
-            base_version=str(self.weight_version),
-            gather_hf_buckets=self._for_each_hf_bucket,
-        )
-        future = None
-        if dist.get_rank() == 0:
-            assert self._control is not None
-            future = self._control.submit(self._activate_on_rank_zero, target_version)
-        try:
-            self._publisher.wait_for_commit(target_version, future)
-        except Exception as error:
-            if isinstance(error, ModelExpressUpdateError):
-                raise
-            raise ModelExpressUpdateError(f"ModelExpress update failed for {target_version}: {error}") from error
-        dist.barrier(group=get_gloo_group())
-        self.weight_version += 1
-        self._metrics = self._publisher.pop_metrics()
+        phase_times = dict.fromkeys(_UPDATE_PHASE_METRICS, 0.0)
+        target_version_number = self.weight_version + 1
+        if self._pending_version_id is None:
+            s3_uri = (
+                f"{self._config['s3_uri_prefix'].rstrip('/')}/v{target_version_number}/model.safetensors.index.json"
+            )
+            if dist.get_rank() == 0:
+                assert self._control is not None
+            phase_started = perf_counter()
+            target_version_id = self._rank_zero_call(
+                lambda: (
+                    self._control.create_weight_version(
+                        model_name=self._config["model_name"],
+                        version_number=target_version_number,
+                        idempotency_key=(f"vime:{self._current_version_id}:v{target_version_number}"),
+                        payload_format=self._WeightPayloadFormat.XOR_DELTA,
+                        base_version_id=self._current_version_id,
+                        s3_uri=s3_uri,
+                        state=self._WeightVersionState.STAGING,
+                    ).version_id
+                ),
+                f"ModelExpress version {target_version_number} creation failed",
+            )
+            phase_times["perf/mx_control_create_weight_version"] = perf_counter() - phase_started
+            self._pending_version_id = str(target_version_id)
 
-    def _for_each_hf_bucket(self, consume: Callable[[Any], None]) -> None:
+        assert self._pending_version_id is not None
+        version = self._WeightVersionRef(self._pending_version_id)
+        if not self._pending_published:
+            phase_started = perf_counter()
+            staged = self._trainer.stage_shard(
+                version=version,
+                hf_tensor_iter=self._iter_hf_buckets(),
+            )
+            phase_times["perf/mx_stage_shard"] = perf_counter() - phase_started
+
+            phase_started = perf_counter()
+            staged.publish()
+            phase_times["perf/mx_publish_shard"] = perf_counter() - phase_started
+            self._pending_published = True
+
+        if not self._pending_ready:
+            dist.barrier(group=get_gloo_group())
+            phase_started = perf_counter()
+            self._rank_zero_call(
+                lambda: self._control.update_weight_version_state(
+                    version.version_id,
+                    self._WeightVersionState.READY,
+                ),
+                f"ModelExpress version {target_version_number} activation failed",
+            )
+            phase_times["perf/mx_publish_server"] = perf_counter() - phase_started
+            self._pending_ready = True
+
+        target_version_id = self._pending_version_id
+        assert target_version_id is not None
+        phase_started = perf_counter()
+        self._rank_zero_call(
+            lambda: self._activate_on_rank_zero(
+                target_version_id,
+                target_version_number,
+            ),
+            f"ModelExpress version {target_version_number} install failed",
+        )
+        phase_times["perf/mx_update_activate_time"] = perf_counter() - phase_started
+        self._current_version_id = target_version_id
+        self._pending_version_id = None
+        self._pending_published = False
+        self._pending_ready = False
+        self.weight_version = target_version_number
+        self._metrics = self._gather_metrics(
+            phase_times=phase_times,
+            group=get_gloo_group(),
+        )
+
+    def _iter_hf_buckets(self):
         for chunk_iter in (
             self._iter_non_expert_chunks(),
             self._iter_expert_chunks(),
         ):
-            for bucket in chunk_iter:
-                consume(bucket)
+            yield from chunk_iter
             dist.barrier(group=get_gloo_group())
 
-    def _activate_on_rank_zero(self, target_version: str) -> None:
+    def _gather_metrics(
+        self,
+        *,
+        phase_times: Mapping[str, float],
+        group: Any,
+    ) -> dict[str, int | float]:
+        local_metrics = self._trainer.pop_metrics()
+        counts = torch.tensor(
+            [
+                local_metrics.get("changed_bytes", 0),
+                local_metrics.get("total_bytes", 0),
+                local_metrics.get("wire_bytes", 0),
+            ],
+            dtype=torch.int64,
+        )
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
+
+        timings = torch.tensor(
+            [
+                local_metrics.get("stage_delta_time", 0.0),
+                local_metrics.get("publish_s3_time", 0.0),
+                *(phase_times[name] for name in _UPDATE_PHASE_METRICS),
+            ],
+            dtype=torch.float64,
+        )
+        dist.all_reduce(timings, op=dist.ReduceOp.MAX, group=group)
+
+        changed_bytes, total_bytes, wire_bytes = counts.tolist()
+        stage_delta_time, publish_s3_time, *phase_values = timings.tolist()
+        return {
+            "perf/update_weights_density": changed_bytes / max(total_bytes, 1),
+            "perf/update_weights_wire_bytes": wire_bytes,
+            "perf/mx_stage_delta_time": stage_delta_time,
+            "perf/mx_publish_s3_time": publish_s3_time,
+            **dict(zip(_UPDATE_PHASE_METRICS, phase_values, strict=True)),
+        }
+
+    def _activate_on_rank_zero(
+        self,
+        target_version_id: str,
+        target_version_number: int,
+    ) -> None:
         engines = tuple(self.rollout_engines or ())
         if not engines:
             raise ModelExpressUpdateError("ModelExpress requires rollout engines")
-        try:
-            ray.get([engine.pause_generation.remote() for engine in engines])
-            ray.get([engine.flush_cache.remote() for engine in engines])
-            ray.get([engine.start_weight_update.remote() for engine in engines])
-            ray.get([engine.update_weights_from_modelexpress.remote(target_version) for engine in engines])
-            ray.get([engine.finish_weight_update.remote() for engine in engines])
-        except Exception as error:
-            raise ModelExpressUpdateError(f"vLLM ModelExpress install failed for {target_version}: {error}") from error
-        self._catalog.commit_revision(self._config["model_id"], target_version)
+        ray.get([engine.pause_generation.remote() for engine in engines])
+        ray.get([engine.flush_cache.remote() for engine in engines])
+        ray.get([engine.start_weight_update.remote() for engine in engines])
+        ray.get([engine.update_weights_from_modelexpress.remote(target_version_id) for engine in engines])
+        ray.get([engine.finish_weight_update.remote(str(target_version_number)) for engine in engines])
         ray.get([engine.continue_generation.remote() for engine in engines])

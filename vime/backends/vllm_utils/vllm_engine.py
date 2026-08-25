@@ -260,10 +260,10 @@ class VLLMEngine(RayActor):
         response.raise_for_status()
         return True
 
-    def update_weights_from_modelexpress(self, target_version: str):
+    def update_weights_from_modelexpress(self, version_id: str):
         return self._make_request(
             "update_weights",
-            {"update_info": {"version": target_version}},
+            {"update_info": {"version_id": version_id}},
         )
 
     def update_weights_from_tensor(
@@ -369,8 +369,12 @@ class VLLMEngine(RayActor):
     def start_draft_weight_update(self) -> dict:
         return self._make_request("start_draft_weight_update", {})
 
-    def finish_weight_update(self) -> dict:
-        return self._make_request("finish_weight_update", {})
+    def finish_weight_update(self, weight_version: str | None = None) -> dict:
+        payload = {} if weight_version is None else {"weight_version": weight_version}
+        result = self._make_request("finish_weight_update", payload)
+        if weight_version is not None:
+            self._weight_version = str(weight_version)
+        return result
 
     def pull_weights(self, target_version: int):
         return self._make_request(

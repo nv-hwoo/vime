@@ -150,7 +150,8 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Carrier for weight sync. In full mode, 'nccl' broadcasts chunks, "
                     "'disk' writes a complete HF checkpoint under --update-weight-disk-dir, and "
-                    "'modelexpress' uses the revision lifecycle configured by --modelexpress-config. "
+                    "'modelexpress' publishes canonical S3 deltas through the version lifecycle "
+                    "configured by --modelexpress-config. "
                     "Delta mode is 'disk' only."
                 ),
             )
@@ -2040,9 +2041,10 @@ def vime_validate_args(args):
         if not isinstance(config, dict):
             raise ValueError("--modelexpress-config must be a JSON object")
         required = {
-            "model_id": config.get("model_id"),
-            "catalog_endpoint": config.get("catalog_endpoint"),
-            "s3_bucket": config.get("s3_bucket"),
+            "model_name": config.get("model_name"),
+            "server_url": config.get("server_url"),
+            "initial_base_version_id": config.get("initial_base_version_id"),
+            "s3_uri_prefix": config.get("s3_uri_prefix"),
             "preparation_cache_dir": config.get("preparation_cache_dir"),
         }
         missing = [name for name, value in required.items() if not value]
@@ -2058,8 +2060,16 @@ def vime_validate_args(args):
             raise ValueError("ModelExpress does not support LoRA weight updates")
         if str(config.get("initial_version", "0")) != "0":
             raise ValueError("ModelExpress requires initial_version=0")
-        if float(config.get("ready_timeout_seconds", 600.0)) <= 0:
-            raise ValueError("ModelExpress ready_timeout_seconds must be positive")
+        if not str(config["s3_uri_prefix"]).startswith("s3://"):
+            raise ValueError("ModelExpress s3_uri_prefix must use the s3:// scheme")
+        if float(config.get("rpc_timeout_seconds", 30.0)) <= 0:
+            raise ValueError("ModelExpress rpc_timeout_seconds must be positive")
+        if int(config.get("max_transfer_attempts", 3)) <= 0:
+            raise ValueError("ModelExpress max_transfer_attempts must be positive")
+        for name in ("registration_ttl_seconds", "lease_ttl_seconds"):
+            value = config.get(name)
+            if value is not None and int(value) <= 0:
+                raise ValueError(f"ModelExpress {name} must be positive")
         if args.update_weight_disk_dir or args.update_weight_local_checkpoint_dir:
             raise ValueError("ModelExpress does not use native disk weight-update directories")
         if args.custom_update_weight_post_write_path:

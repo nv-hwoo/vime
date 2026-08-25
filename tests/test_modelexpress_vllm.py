@@ -33,9 +33,58 @@ def test_modelexpress_proxy_sends_exact_target_through_vllm_weight_transfer(monk
         lambda endpoint, payload=None: calls.append((endpoint, payload)),
     )
 
-    engine.update_weights_from_modelexpress("7")
+    engine.update_weights_from_modelexpress("a1b2c3d4")
 
-    assert calls == [("update_weights", {"update_info": {"version": "7"}})]
+    assert calls == [("update_weights", {"update_info": {"version_id": "a1b2c3d4"}})]
+
+
+def test_finish_weight_update_records_version_after_success(monkeypatch):
+    engine = VLLMEngine.__new__(VLLMEngine)
+    engine._weight_version = "old"
+    calls = []
+
+    def finish(endpoint, payload=None):
+        calls.append((endpoint, payload))
+        return {"done": True}
+
+    monkeypatch.setattr(engine, "_make_request", finish)
+
+    result = engine.finish_weight_update("opaque-a")
+
+    assert result == {"done": True}
+    assert calls == [("finish_weight_update", {"weight_version": "opaque-a"})]
+    assert engine._weight_version == "opaque-a"
+
+
+def test_finish_weight_update_preserves_version_when_request_fails(monkeypatch):
+    engine = VLLMEngine.__new__(VLLMEngine)
+    engine._weight_version = "old"
+
+    def fail(_endpoint, _payload=None):
+        raise RuntimeError("finish failed")
+
+    monkeypatch.setattr(engine, "_make_request", fail)
+
+    with pytest.raises(RuntimeError, match="finish failed"):
+        engine.finish_weight_update("opaque-a")
+
+    assert engine._weight_version == "old"
+
+
+def test_finish_weight_update_without_version_preserves_existing_behavior(monkeypatch):
+    engine = VLLMEngine.__new__(VLLMEngine)
+    engine._weight_version = "old"
+    calls = []
+    monkeypatch.setattr(
+        engine,
+        "_make_request",
+        lambda endpoint, payload=None: calls.append((endpoint, payload)),
+    )
+
+    engine.finish_weight_update()
+
+    assert calls == [("finish_weight_update", {})]
+    assert engine._weight_version == "old"
 
 
 def test_modelexpress_selects_vllm_backend(monkeypatch):
