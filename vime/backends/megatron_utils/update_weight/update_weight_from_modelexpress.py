@@ -62,7 +62,9 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
             ModelExpressControlClient,
             ModelExpressTrainerClient,
             ModelExpressTrainerConfig,
-            S3Config,
+            ObjectStorageConfig,
+            ObjectStorageSource,
+            ObjectStorageType,
             TrainerStagingMode,
             WeightPayloadFormat,
             WeightVersionRef,
@@ -70,9 +72,18 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         )
 
         self._WeightPayloadFormat = WeightPayloadFormat
+        self._ObjectStorageSource = ObjectStorageSource
         self._WeightVersionRef = WeightVersionRef
         self._WeightVersionState = WeightVersionState
         rpc_timeout_seconds = float(self._config.get("rpc_timeout_seconds", 30.0))
+        self._object_storage_config = ObjectStorageConfig(
+            storage_type=ObjectStorageType.S3,
+            uri_prefix=self._config["s3_uri_prefix"],
+            initial_base_version_id=self._current_version_id,
+            launch_checkpoint=vars(args)["hf_checkpoint"],
+            endpoint_url=self._config.get("s3_endpoint_url"),
+            region_name=self._config.get("s3_region_name"),
+        )
 
         if trainer_client is None:
             registration_ttl = self._config.get("registration_ttl_seconds")
@@ -85,13 +96,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
                     registration_ttl_seconds=(int(registration_ttl) if registration_ttl is not None else None),
                     rpc_timeout_seconds=rpc_timeout_seconds,
                     process_group=get_gloo_group(),
-                    s3=S3Config(
-                        uri_prefix=self._config["s3_uri_prefix"],
-                        initial_base_version_id=self._current_version_id,
-                        launch_checkpoint=vars(args)["hf_checkpoint"],
-                        endpoint_url=self._config.get("s3_endpoint_url"),
-                        region_name=self._config.get("s3_region_name"),
-                    ),
+                    object_storage=self._object_storage_config,
                 )
             )
         self._trainer = trainer_client
@@ -137,8 +142,9 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
             "initial_base_version_id": self._current_version_id,
             "launch_checkpoint": vars(self.args)["hf_checkpoint"],
             "preparation_cache_dir": self._config["preparation_cache_dir"],
-            "s3_endpoint_url": self._config.get("s3_endpoint_url"),
-            "s3_region_name": self._config.get("s3_region_name"),
+            "object_storage_type": self._object_storage_config.storage_type.value,
+            "object_storage_endpoint_url": self._config.get("s3_endpoint_url"),
+            "object_storage_region_name": self._config.get("s3_region_name"),
             "registration_ttl_seconds": int(registration_ttl) if registration_ttl is not None else None,
             "lease_ttl_seconds": int(lease_ttl) if lease_ttl is not None else None,
             "max_transfer_attempts": int(self._config.get("max_transfer_attempts", 3)),
@@ -183,9 +189,6 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         phase_times = dict.fromkeys(_UPDATE_PHASE_METRICS, 0.0)
         target_version_number = self.weight_version + 1
         if self._pending_version_id is None:
-            s3_uri = (
-                f"{self._config['s3_uri_prefix'].rstrip('/')}/v{target_version_number}/model.safetensors.index.json"
-            )
             if dist.get_rank() == 0:
                 assert self._control is not None
             phase_started = perf_counter()
@@ -197,7 +200,10 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
                         idempotency_key=(f"vime:{self._current_version_id}:v{target_version_number}"),
                         payload_format=self._WeightPayloadFormat.XOR_DELTA,
                         base_version_id=self._current_version_id,
-                        s3_uri=s3_uri,
+                        object_storage=self._ObjectStorageSource(
+                            storage_type=self._object_storage_config.storage_type,
+                            uri=self._object_storage_config.root_uri(target_version_number),
+                        ),
                         state=self._WeightVersionState.STAGING,
                     ).version_id
                 ),
@@ -283,7 +289,7 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         timings = torch.tensor(
             [
                 local_metrics.get("stage_delta_time", 0.0),
-                local_metrics.get("publish_s3_time", 0.0),
+                local_metrics.get("publish_object_storage_time", 0.0),
                 *(phase_times[name] for name in _UPDATE_PHASE_METRICS),
             ],
             dtype=torch.float64,
@@ -291,12 +297,12 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
         dist.all_reduce(timings, op=dist.ReduceOp.MAX, group=group)
 
         changed_bytes, total_bytes, wire_bytes = counts.tolist()
-        stage_delta_time, publish_s3_time, *phase_values = timings.tolist()
+        stage_delta_time, publish_object_storage_time, *phase_values = timings.tolist()
         return {
             "perf/update_weights_density": changed_bytes / max(total_bytes, 1),
             "perf/update_weights_wire_bytes": wire_bytes,
             "perf/mx_stage_delta_time": stage_delta_time,
-            "perf/mx_publish_s3_time": publish_s3_time,
+            "perf/mx_publish_object_storage_time": publish_object_storage_time,
             **dict(zip(_UPDATE_PHASE_METRICS, phase_values, strict=True)),
         }
 

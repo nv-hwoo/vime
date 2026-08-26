@@ -50,6 +50,21 @@ class WeightVersionState(Enum):
     READY = "READY"
 
 
+class ObjectStorageType(Enum):
+    S3 = "S3"
+
+
+class ObjectStorageConfig(SimpleNamespace):
+    def root_uri(self, version_number):
+        return f"{self.uri_prefix.rstrip('/')}/v{version_number}/model.safetensors.index.json"
+
+
+@dataclass(frozen=True)
+class ObjectStorageSource:
+    storage_type: ObjectStorageType
+    uri: str
+
+
 @dataclass(frozen=True)
 class WeightVersionRef:
     version_id: str
@@ -59,7 +74,9 @@ modelexpress_rl = types.ModuleType("modelexpress_rl")
 modelexpress_rl.ModelExpressControlClient = object
 modelexpress_rl.ModelExpressTrainerClient = object
 modelexpress_rl.ModelExpressTrainerConfig = object
-modelexpress_rl.S3Config = object
+modelexpress_rl.ObjectStorageConfig = ObjectStorageConfig
+modelexpress_rl.ObjectStorageSource = ObjectStorageSource
+modelexpress_rl.ObjectStorageType = ObjectStorageType
 modelexpress_rl.TrainerStagingMode = SimpleNamespace(WRITE_TO_STORAGE="WRITE_TO_STORAGE")
 modelexpress_rl.WeightPayloadFormat = WeightPayloadFormat
 modelexpress_rl.WeightVersionRef = WeightVersionRef
@@ -121,7 +138,7 @@ class FakeTrainer:
             "total_bytes": 100,
             "wire_bytes": 123,
             "stage_delta_time": 7.0,
-            "publish_s3_time": 8.0,
+            "publish_object_storage_time": 8.0,
         }
 
     def prepare_delta_base(self, *, hf_tensor_iter):
@@ -245,6 +262,37 @@ def updater(control, trainer):
     return instance
 
 
+def test_vime_builds_generic_trainer_object_storage_config(monkeypatch):
+    captured = {}
+
+    class Config(SimpleNamespace):
+        pass
+
+    class TrainerClient:
+        @staticmethod
+        def initialize(config):
+            captured["config"] = config
+            return FakeTrainer()
+
+    monkeypatch.setattr(modelexpress_rl, "ModelExpressTrainerClient", TrainerClient)
+    monkeypatch.setattr(modelexpress_rl, "ModelExpressTrainerConfig", Config)
+
+    UpdateWeightFromModelExpress(
+        args(),
+        model=[],
+        weights_getter=lambda: {},
+        model_name="qwen3",
+        quantization_config=None,
+        control_client=FakeControl(),
+    )
+
+    config = captured["config"]
+    assert config.object_storage.storage_type is ObjectStorageType.S3
+    assert config.object_storage.uri_prefix == "s3://weights/run/policy"
+    assert not hasattr(config.object_storage, "process_group")
+    assert config.process_group is not None
+
+
 def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(monkeypatch):
     control = FakeControl()
     trainer = FakeTrainer()
@@ -282,7 +330,10 @@ def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(monkeypatch)
             "idempotency_key": "vime:base-uid:v1",
             "payload_format": WeightPayloadFormat.XOR_DELTA,
             "base_version_id": "base-uid",
-            "s3_uri": "s3://weights/run/policy/v1/model.safetensors.index.json",
+            "object_storage": ObjectStorageSource(
+                storage_type=ObjectStorageType.S3,
+                uri="s3://weights/run/policy/v1/model.safetensors.index.json",
+            ),
             "state": WeightVersionState.STAGING,
         }
     ]
@@ -296,8 +347,9 @@ def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(monkeypatch)
                 "initial_base_version_id": "base-uid",
                 "launch_checkpoint": "/models/model",
                 "preparation_cache_dir": "/mxdelta/mxprep",
-                "s3_endpoint_url": "http://minio:9000",
-                "s3_region_name": "us-west-2",
+                "object_storage_type": "S3",
+                "object_storage_endpoint_url": "http://minio:9000",
+                "object_storage_region_name": "us-west-2",
                 "registration_ttl_seconds": None,
                 "lease_ttl_seconds": None,
                 "max_transfer_attempts": 4,
@@ -319,7 +371,7 @@ def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(monkeypatch)
         "perf/update_weights_density": 0.25,
         "perf/update_weights_wire_bytes": 246,
         "perf/mx_stage_delta_time": 17.0,
-        "perf/mx_publish_s3_time": 18.0,
+        "perf/mx_publish_object_storage_time": 18.0,
         "perf/mx_control_create_weight_version": 11.0,
         "perf/mx_stage_shard": 12.0,
         "perf/mx_publish_shard": 13.0,
