@@ -192,17 +192,21 @@ class UpdateWeightFromModelExpress(UpdateWeightFromDiskDelta):
             if dist.get_rank() == 0:
                 assert self._control is not None
             phase_started = perf_counter()
+            object_storage_uri = (
+                f"{self._object_storage_config.uri_prefix.rstrip('/')}"
+                f"/v{target_version_number}/model.safetensors.index.json"
+            )
             target_version_id = self._rank_zero_call(
                 lambda: (
                     self._control.create_weight_version(
+                        uid=f"v{target_version_number}",
                         model_name=self._config["model_name"],
-                        version_number=target_version_number,
                         idempotency_key=(f"vime:{self._current_version_id}:v{target_version_number}"),
                         payload_format=self._WeightPayloadFormat.XOR_DELTA,
                         base_version_id=self._current_version_id,
                         object_storage=self._ObjectStorageSource(
                             storage_type=self._object_storage_config.storage_type,
-                            uri=self._object_storage_config.root_uri(target_version_number),
+                            uri=object_storage_uri,
                         ),
                         state=self._WeightVersionState.STAGING,
                     ).version_id

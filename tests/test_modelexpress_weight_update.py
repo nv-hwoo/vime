@@ -55,8 +55,7 @@ class ObjectStorageType(Enum):
 
 
 class ObjectStorageConfig(SimpleNamespace):
-    def root_uri(self, version_number):
-        return f"{self.uri_prefix.rstrip('/')}/v{version_number}/model.safetensors.index.json"
+    pass
 
 
 @dataclass(frozen=True)
@@ -108,7 +107,7 @@ class FakeControl:
 
     def create_weight_version(self, **kwargs):
         self.created.append(kwargs)
-        return SimpleNamespace(version_id=f"uid-{kwargs['version_number']}")
+        return SimpleNamespace(version_id=kwargs["uid"])
 
     def update_weight_version_state(self, version_id, state):
         self.state_updates.append((version_id, state))
@@ -321,12 +320,12 @@ def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(monkeypatch)
     instance.update_weights()
 
     assert trainer.baselines
-    assert trainer.stages[0][0] == "uid-1"
-    assert trainer.publishes[0][0] == "uid-1"
+    assert trainer.stages[0][0] == "v1"
+    assert trainer.publishes[0][0] == "v1"
     assert control.created == [
         {
+            "uid": "v1",
             "model_name": "policy",
-            "version_number": 1,
             "idempotency_key": "vime:base-uid:v1",
             "payload_format": WeightPayloadFormat.XOR_DELTA,
             "base_version_id": "base-uid",
@@ -337,7 +336,7 @@ def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(monkeypatch)
             "state": WeightVersionState.STAGING,
         }
     ]
-    assert control.state_updates == [("uid-1", WeightVersionState.READY)]
+    assert control.state_updates == [("v1", WeightVersionState.READY)]
     assert events[0] == (
         "init",
         {
@@ -361,12 +360,12 @@ def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(monkeypatch)
         "pause",
         "flush",
         "start",
-        "update:uid-1",
+        "update:v1",
         "finish:1",
         "continue",
     ]
     assert instance.weight_version == 1
-    assert instance._current_version_id == "uid-1"
+    assert instance._current_version_id == "v1"
     assert instance.pop_metrics() == {
         "perf/update_weights_density": 0.25,
         "perf/update_weights_wire_bytes": 246,
@@ -426,7 +425,7 @@ def test_ready_transition_retries_without_republishing():
     with pytest.raises(ModelExpressUpdateError, match="ready failed"):
         instance.update_weights()
 
-    assert instance._pending_version_id == "uid-1"
+    assert instance._pending_version_id == "v1"
     assert instance._pending_published
     assert not instance._pending_ready
     assert len(control.created) == 1
@@ -452,7 +451,7 @@ def test_failed_vllm_update_retries_the_ready_version_without_republishing():
         instance.update_weights()
 
     assert instance.weight_version == 0
-    assert instance._pending_version_id == "uid-1"
+    assert instance._pending_version_id == "v1"
     assert len(control.created) == 1
     assert len(trainer.publishes) == 1
     assert not any(event == "continue" for event, _payload in events[1:])
@@ -461,7 +460,7 @@ def test_failed_vllm_update_retries_the_ready_version_without_republishing():
     instance.update_weights()
 
     assert instance.weight_version == 1
-    assert instance._current_version_id == "uid-1"
+    assert instance._current_version_id == "v1"
     assert instance._pending_version_id is None
     assert len(control.created) == 1
     assert len(trainer.publishes) == 1
