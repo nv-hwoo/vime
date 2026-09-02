@@ -264,6 +264,28 @@ def test_inference_generate_tokens_and_logprobs_rejects_invalid_token_ids():
 
 
 @pytest.mark.unit
+def test_build_inference_sampling_params_omits_negative_sentinels_for_dynamo():
+    sp = mod._build_inference_sampling_params(
+        {"max_new_tokens": 8, "temperature": 0.0, "top_p": 1.0, "top_k": -1, "seed": -1},
+        dynamo=True,
+    )
+
+    assert "top_k" not in sp
+    assert "seed" not in sp
+
+
+@pytest.mark.unit
+def test_build_inference_sampling_params_preserves_positive_values_for_dynamo():
+    sp = mod._build_inference_sampling_params(
+        {"max_new_tokens": 8, "temperature": 0.0, "top_p": 1.0, "top_k": 4, "seed": 7},
+        dynamo=True,
+    )
+
+    assert sp["top_k"] == 4
+    assert sp["seed"] == 7
+
+
+@pytest.mark.unit
 def test_mm_render_response_to_generate_body_flat_dict():
     body = mod._mm_render_response_to_generate_body(
         {"token_ids": [1, 2], "features": {"x": 1}},

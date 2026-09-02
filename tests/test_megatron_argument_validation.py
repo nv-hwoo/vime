@@ -476,6 +476,27 @@ def test_modelexpress_uses_existing_transfer_selector_and_one_json_config(monkey
 
 
 @pytest.mark.unit
+def test_dynamo_external_rollout_urls_are_parsed(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    module.get_vime_extra_args_provider()(parser)
+
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--rollout-dynamo-generation-url",
+            "http://dynamo-frontend:8000",
+            "--rollout-dynamo-rl-discovery-url",
+            "http://dynamo-frontend:8001",
+        ]
+    )
+
+    assert args.rollout_dynamo_generation_url == "http://dynamo-frontend:8000"
+    assert args.rollout_dynamo_rl_discovery_url == "http://dynamo-frontend:8001"
+
+
+@pytest.mark.unit
 def test_modelexpress_config_rejects_non_object_json(monkeypatch):
     module = load_vime_arguments_module(monkeypatch)
     args = make_vime_validate_args(

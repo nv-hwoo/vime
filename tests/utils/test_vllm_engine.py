@@ -367,6 +367,129 @@ def test_get_base_gpu_id_colocate(vllm_args):
 
 
 @pytest.mark.unit
+def test_dynamo_external_init_skips_vanilla_server_info(vllm_args, monkeypatch):
+    engine = mod.VLLMEngine(
+        vllm_args,
+        rank=0,
+        control_url="http://worker-0:8081",
+    )
+    registered = []
+
+    def fail_server_info(_url):
+        raise AssertionError("Dynamo frontend must not be probed as vanilla vLLM")
+
+    monkeypatch.setattr(mod, "get_server_info", fail_server_info)
+    monkeypatch.setattr(engine, "_register_to_router", lambda args: registered.append(args))
+
+    engine._init_external({"host": "frontend", "port": 8000}, set())
+
+    assert registered == [{"host": "frontend", "port": 8000}]
+
+
+@pytest.mark.unit
+def test_dynamo_update_weights_uses_worker_control_route(vllm_args, monkeypatch):
+    engine = mod.VLLMEngine(
+        vllm_args,
+        rank=0,
+        control_url="http://worker-0:8081",
+    )
+    engine.node_rank = 0
+    engine.server_host = "frontend"
+    engine.server_port = 8000
+    calls = []
+
+    def fake_post(url, json):
+        calls.append((url, json))
+        return _MockResponse(json_data={"status": "ok"})
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    result = engine.update_weights({"version_id": "target-uid"})
+
+    assert result == {"status": "ok"}
+    assert calls == [
+        (
+            "http://worker-0:8081/engine/update/update_weights",
+            {"update_info": {"version_id": "target-uid"}},
+        )
+    ]
+
+
+@pytest.mark.unit
+def test_dynamo_refit_lifecycle_uses_native_routes(vllm_args, monkeypatch):
+    engine = mod.VLLMEngine(
+        vllm_args,
+        rank=0,
+        control_url="http://worker-0:8081",
+    )
+    engine.node_rank = 0
+    engine.server_host = "frontend"
+    engine.server_port = 8000
+    calls = []
+
+    def fake_post(url, json):
+        calls.append((url, json))
+        return _MockResponse(json_data={"status": "ok"})
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    engine.pause_generation()
+    engine.flush_cache()
+    engine.start_weight_update()
+    engine.update_weights({"version_id": "target-uid"})
+    engine.finish_weight_update()
+    engine.continue_generation()
+
+    assert calls == [
+        ("http://worker-0:8081/engine/control/pause_generation", {"mode": "keep", "clear_cache": False}),
+        (
+            "http://worker-0:8081/engine/control/pause_generation",
+            {"mode": "keep", "clear_cache": True},
+        ),
+        ("http://worker-0:8081/engine/update/start_weight_update", {}),
+        (
+            "http://worker-0:8081/engine/update/update_weights",
+            {"update_info": {"version_id": "target-uid"}},
+        ),
+        (
+            "http://worker-0:8081/engine/update/finish_weight_update",
+            {},
+        ),
+        ("http://worker-0:8081/engine/control/resume_generation", {}),
+    ]
+
+
+@pytest.mark.unit
+def test_dynamo_weight_version_uses_worker_routes(vllm_args, monkeypatch):
+    engine = mod.VLLMEngine(
+        vllm_args,
+        rank=0,
+        control_url="http://worker-0:8081",
+    )
+    engine.node_rank = 0
+    calls = []
+
+    def fake_post(url, json):
+        calls.append((url, json))
+        return _MockResponse(json_data={"weight_version": "target-uid"})
+
+    monkeypatch.setattr(mod.requests, "post", fake_post)
+
+    engine.set_weight_version("target-uid")
+    assert engine.get_weight_version() == "target-uid"
+    assert calls == [
+        (
+            "http://worker-0:8081/engine/update/update_weight_version",
+            {"new_version": "target-uid"},
+        ),
+        (
+            "http://worker-0:8081/engine/control/get_weight_version",
+            {},
+        ),
+    ]
+
+
+@pytest.mark.unit
 def test_start_weight_update_posts_four_phase_endpoint(vllm_engine, monkeypatch):
     calls: list[tuple] = []
 

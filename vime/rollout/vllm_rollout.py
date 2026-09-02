@@ -208,7 +208,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
-def _build_inference_sampling_params(sampling_params: dict[str, Any]) -> dict[str, Any]:
+def _build_inference_sampling_params(sampling_params: dict[str, Any], *, dynamo: bool = False) -> dict[str, Any]:
     """Map rollout ``sampling_params`` to vLLM ``/inference/v1/generate`` body."""
     sp: dict[str, Any] = {
         "max_tokens": sampling_params["max_new_tokens"],
@@ -217,7 +217,7 @@ def _build_inference_sampling_params(sampling_params: dict[str, Any]) -> dict[st
         "logprobs": 1,
     }
     tk = sampling_params.get("top_k")
-    if tk is not None and (tk > 0 or tk == -1):
+    if tk is not None and (tk > 0 or (tk == -1 and not dynamo)):
         sp["top_k"] = tk
     if sampling_params.get("stop"):
         sp["stop"] = sampling_params["stop"]
@@ -225,8 +225,9 @@ def _build_inference_sampling_params(sampling_params: dict[str, Any]) -> dict[st
             sp["include_stop_str_in_output"] = True
     if sampling_params.get("stop_token_ids"):
         sp["stop_token_ids"] = sampling_params["stop_token_ids"]
-    if sampling_params.get("seed") is not None:
-        sp["seed"] = sampling_params["seed"]
+    seed = sampling_params.get("seed")
+    if seed is not None and (seed >= 0 or not dynamo):
+        sp["seed"] = seed
     if sampling_params.get("skip_special_tokens") is not None:
         sp["skip_special_tokens"] = bool(sampling_params["skip_special_tokens"])
     return sp
@@ -359,7 +360,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.status = Sample.Status.TRUNCATED
         return sample
 
-    inference_sampling_params = _build_inference_sampling_params(sampling_params)
+    inference_sampling_params = _build_inference_sampling_params(
+        sampling_params,
+        dynamo=getattr(args, "rollout_dynamo_generation_url", None) is not None,
+    )
 
     messages = build_multimodal_messages(sample.prompt, sample.multimodal_inputs)
 

@@ -605,6 +605,18 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 nargs="+",
                 help="Address and ports of the external engines.",
             )
+            parser.add_argument(
+                "--rollout-dynamo-generation-url",
+                type=str,
+                default=None,
+                help="Dynamo worker URL serving /inference/v1/generate.",
+            )
+            parser.add_argument(
+                "--rollout-dynamo-rl-discovery-url",
+                type=str,
+                default=None,
+                help="Dynamo frontend RL discovery URL serving /v1/rl/workers.",
+            )
             return parser
 
         def add_fault_tolerance_arguments(parser):
@@ -2047,7 +2059,11 @@ def vime_validate_args(args):
         )
         args.debug_train_only = True
 
-    args.rollout_external = args.rollout_external_engine_addrs is not None
+    args.rollout_external = (
+        args.rollout_external_engine_addrs is not None
+        or getattr(args, "rollout_dynamo_generation_url", None) is not None
+        or getattr(args, "rollout_dynamo_rl_discovery_url", None) is not None
+    )
 
     if args.rollout_external and not args.debug_train_only:
         apply_external_engine_info_to_args(args, logger=logger)

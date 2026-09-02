@@ -127,6 +127,7 @@ class VLLMEngine(RayActor):
         base_gpu_id: int | None = None,
         vllm_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
+        control_url: str | None = None,
     ):
         self.args = args
         self.rank = rank
@@ -134,6 +135,7 @@ class VLLMEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.vllm_overrides = vllm_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self.control_url = control_url.rstrip("/") if control_url else None
         self._weight_version: str | None = None
 
     def init(
@@ -145,8 +147,12 @@ class VLLMEngine(RayActor):
         disaggregation_bootstrap_port=None,
         router_ip=None,
         router_port=None,
+        control_url=None,
     ):
         del nccl_port
+
+        if control_url is not None:
+            self.control_url = control_url.rstrip("/")
 
         self.router_ip = _wrap_ipv6(router_ip) if router_ip is not None else None
         self.router_port = router_port
@@ -181,6 +187,9 @@ class VLLMEngine(RayActor):
 
     def _init_external(self, expect_server_args, external_engine_need_check_fields):
         logger.info(f"Use external vLLM engine (rank={self.rank}, expect_server_args={expect_server_args})")
+        if self.control_url:
+            self._register_to_router(expect_server_args)
+            return
 
         def _matches_expected(actual, expected):
             if isinstance(actual, dict) and isinstance(expected, dict):
@@ -242,7 +251,23 @@ class VLLMEngine(RayActor):
         if self.node_rank != 0:
             return
 
-        url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
+        if self.control_url:
+            group = (
+                "update"
+                if endpoint
+                in {
+                    "init_weight_transfer_engine",
+                    "start_weight_update",
+                    "start_draft_weight_update",
+                    "update_weights",
+                    "update_weight_version",
+                    "finish_weight_update",
+                }
+                else "control"
+            )
+            url = f"{self.control_url}/engine/{group}/{endpoint}"
+        else:
+            url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
         response = requests.post(url, json=payload or {})
         try:
             response.raise_for_status()
@@ -251,7 +276,10 @@ class VLLMEngine(RayActor):
             raise
         if not response.content or not response.content.strip():
             return {"ok": True}
-        return response.json()
+        result = response.json()
+        if self.control_url and result.get("status") == "error":
+            raise RuntimeError(f"Dynamo route {url} failed: {result}")
+        return result
 
     def health_generate(self, timeout: float = 5.0) -> bool:
         if self.node_rank != 0:
@@ -285,6 +313,11 @@ class VLLMEngine(RayActor):
     def flush_cache(self):
         if self.node_rank != 0:
             return
+        if self.control_url:
+            return self._make_request(
+                "pause_generation",
+                {"mode": "keep", "clear_cache": True},
+            )
         params = {"reset_running_requests": False}
         requests.post(
             f"http://{self.server_host}:{self.server_port}/reset_prefix_cache", params=params
@@ -321,13 +354,16 @@ class VLLMEngine(RayActor):
     def get_weight_version(self):
         if self.node_rank != 0:
             return
-        response = requests.get(f"http://{self.server_host}:{self.server_port}/weight_info")
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as error:
-            error.add_note(f"{response.text=}")
-            raise
-        weight_version = response.json()["weight_version"]
+        if self.control_url:
+            weight_version = self._make_request("get_weight_version", {})["weight_version"]
+        else:
+            response = requests.get(f"http://{self.server_host}:{self.server_port}/weight_info")
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as error:
+                error.add_note(f"{response.text=}")
+                raise
+            weight_version = response.json()["weight_version"]
         self._weight_version = None if weight_version is None else str(weight_version)
         return self._weight_version
 
@@ -459,6 +495,11 @@ class VLLMEngine(RayActor):
     def pause_generation(self):
         if self.node_rank != 0:
             return
+        if self.control_url:
+            return self._make_request(
+                "pause_generation",
+                {"mode": "keep", "clear_cache": False},
+            )
         response = requests.post(
             f"http://{self.server_host}:{self.server_port}/pause",
             params={"mode": "keep", "clear_cache": "false"},
@@ -470,6 +511,8 @@ class VLLMEngine(RayActor):
     def continue_generation(self):
         if self.node_rank != 0:
             return
+        if self.control_url:
+            return self._make_request("resume_generation", {})
         response = requests.post(f"http://{self.server_host}:{self.server_port}/resume", json={})
         response.raise_for_status()
         return response

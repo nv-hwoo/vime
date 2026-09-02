@@ -12,7 +12,9 @@ if str(REPO_ROOT) not in sys.path:
 from vime.backends.vllm_utils.external import (
     ExternalEngineInfo,
     apply_external_engine_info_to_args,
+    discover_dynamo_engine,
     discover_external_engines,
+    external_engine_init_kwargs,
     get_server_info,
     start_external_rollout_servers,
 )
@@ -32,6 +34,79 @@ class _Response:
 
     def json(self):
         return self.payload
+
+
+def test_discover_dynamo_engine_separates_generation_and_control(monkeypatch):
+    def fake_get(url, timeout):
+        assert timeout == 30.0
+        assert url == "http://frontend:8001/v1/rl/workers"
+        return _Response(
+            {
+                "workers": [
+                    {
+                        "system_url": "http://worker-0:8081",
+                        "world_size": 4,
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("vime.backends.vllm_utils.external.requests.get", fake_get)
+
+    info = discover_dynamo_engine(
+        "http://frontend:8000",
+        "http://frontend:8001",
+    )
+
+    assert info.url == "http://frontend:8000"
+    assert info.host == "frontend"
+    assert info.port == 8000
+    assert info.control_url == "http://worker-0:8081"
+    assert info.worker_type == "regular"
+    assert info.num_gpus == 4
+
+
+def test_external_engine_init_kwargs_preserves_dynamo_control_url():
+    info = ExternalEngineInfo(
+        url="http://frontend:8000",
+        host="frontend",
+        port=8000,
+        worker_type="regular",
+        num_gpus=1,
+        control_url="http://worker-0:8081",
+    )
+
+    assert external_engine_init_kwargs(info)["control_url"] == "http://worker-0:8081"
+
+
+def test_apply_external_engine_info_uses_dynamo_discovery(monkeypatch):
+    info = ExternalEngineInfo(
+        url="http://frontend:8000",
+        host="frontend",
+        port=8000,
+        worker_type="regular",
+        num_gpus=4,
+        control_url="http://worker-0:8081",
+    )
+    calls = []
+
+    def fake_discover(frontend_url, discovery_url):
+        calls.append((frontend_url, discovery_url))
+        return info
+
+    monkeypatch.setattr("vime.backends.vllm_utils.external.discover_dynamo_engine", fake_discover)
+    args = Namespace(
+        rollout_external_engine_addrs=None,
+        rollout_dynamo_generation_url="http://frontend:8000",
+        rollout_dynamo_rl_discovery_url="http://frontend:8001",
+    )
+
+    apply_external_engine_info_to_args(args)
+
+    assert calls == [("http://frontend:8000", "http://frontend:8001")]
+    assert args.rollout_num_engines == 1
+    assert args.rollout_num_gpus == 4
+    assert args.rollout_external_engine_infos == [info.to_dict()]
 
 
 def test_discover_external_engines_reads_server_info(monkeypatch):

@@ -18,6 +18,7 @@ class ExternalEngineInfo:
     port: int
     worker_type: str
     num_gpus: int
+    control_url: str | None = None
     disaggregation_bootstrap_port: int | None = None
     server_info: dict = dataclasses.field(default_factory=dict)
 
@@ -70,6 +71,8 @@ def external_engine_init_kwargs(info: ExternalEngineInfo) -> dict:
         "host": info.host,
         "port": info.port,
     }
+    if info.control_url is not None:
+        init_kwargs["control_url"] = info.control_url
     if info.worker_type == "prefill":
         init_kwargs["disaggregation_bootstrap_port"] = info.disaggregation_bootstrap_port
     return init_kwargs
@@ -148,6 +151,40 @@ def _infer_worker_type(server_info: dict) -> str:
     return "regular"
 
 
+def discover_dynamo_engine(
+    generation_url: str,
+    rl_discovery_url: str,
+    timeout: float = 30.0,
+) -> ExternalEngineInfo:
+    generation_url = normalize_external_engine_addr(generation_url)
+    rl_discovery_url = normalize_external_engine_addr(rl_discovery_url)
+    response = requests.get(f"{rl_discovery_url}/v1/rl/workers", timeout=timeout)
+    response.raise_for_status()
+    workers = response.json().get("workers", [])
+    if len(workers) != 1:
+        raise RuntimeError(
+            "The initial Dynamo external rollout integration requires exactly one worker; "
+            f"discovered {len(workers)}"
+        )
+    worker = workers[0]
+    control_url = worker.get("system_url")
+    if not isinstance(control_url, str) or not control_url:
+        raise RuntimeError("Dynamo RL discovery worker is missing system_url")
+    control_url = normalize_external_engine_addr(control_url)
+    parsed = urlparse(generation_url)
+    assert parsed.hostname is not None and parsed.port is not None
+    world_size = int(worker.get("world_size") or 1)
+    return ExternalEngineInfo(
+        url=generation_url,
+        host=parsed.hostname,
+        port=parsed.port,
+        worker_type="regular",
+        num_gpus=world_size,
+        control_url=control_url,
+        server_info={"tp_size": world_size, "pp_size": 1},
+    )
+
+
 def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[ExternalEngineInfo]:
     infos = []
     for addr in addrs:
@@ -185,12 +222,21 @@ def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[E
 def apply_external_engine_info_to_args(args, logger=None) -> None:
     """Detect external engines and store the derived topology on ``args``."""
     addrs = args.rollout_external_engine_addrs
-    if not addrs:
-        raise ValueError("apply_external_engine_info_to_args requires --rollout-external-engine-addrs.")
-
-    infos = discover_external_engines(addrs)
+    dynamo_frontend = getattr(args, "rollout_dynamo_generation_url", None)
+    dynamo_discovery = getattr(args, "rollout_dynamo_rl_discovery_url", None)
+    if bool(dynamo_frontend) != bool(dynamo_discovery):
+        raise ValueError("--rollout-dynamo-generation-url and --rollout-dynamo-rl-discovery-url must be set together.")
+    if addrs and dynamo_frontend:
+        raise ValueError("--rollout-external-engine-addrs cannot be combined with Dynamo rollout URLs.")
+    if dynamo_frontend:
+        assert dynamo_discovery is not None
+        infos = [discover_dynamo_engine(dynamo_frontend, dynamo_discovery)]
+    elif addrs:
+        infos = discover_external_engines(addrs)
+    else:
+        raise ValueError("External rollout requires --rollout-external-engine-addrs or the Dynamo rollout URL pair.")
     if not infos:
-        raise ValueError("--rollout-external-engine-addrs did not contain any engines.")
+        raise ValueError("External rollout engine discovery returned no engines.")
 
     args.rollout_external_engine_infos = [info.to_dict() for info in infos]
     args.rollout_num_engines = len(infos)
