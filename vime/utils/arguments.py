@@ -160,6 +160,9 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "ModelExpress configuration as a JSON object, including "
                     "seed_checkpoint_path and refit_checkpoint_dir. Set "
+                    "refit_checkpoint_max_size_gb to a positive integer for the rollout "
+                    "checkpoint-cache quota in decimal GB; omission keeps the ModelExpress "
+                    "default and null disables the quota. Set "
                     "full_hf_checkpoint_interval to a positive integer to publish "
                     "periodic full HF checkpoints."
                 ),
