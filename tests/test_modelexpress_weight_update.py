@@ -445,6 +445,20 @@ def test_vime_initializes_vllm_and_publishes_version_owned_s3_delta(monkeypatch)
     ]
 
 
+@pytest.mark.parametrize("max_size_gb", [16, None])
+def test_vime_forwards_refit_checkpoint_cache_limit(monkeypatch, max_size_gb):
+    instance = updater(
+        monkeypatch,
+        FakeControl(),
+        FakeTrainer(),
+        refit_checkpoint_max_size_gb=max_size_gb,
+    )
+    events = []
+    instance.connect_rollout_engines([FakeEngine(events)], object())
+
+    assert events[0][1]["init_info"]["refit_checkpoint_max_size_gb"] == max_size_gb
+
+
 def test_vime_publishes_periodic_full_hf_checkpoints(monkeypatch):
     control = FakeControl()
     instance = updater(

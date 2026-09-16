@@ -149,6 +149,8 @@ class UpdateWeightFromModelExpress:
             "max_transfer_attempts": self._config.get("max_transfer_attempts", 3),
             "rpc_timeout_seconds": self._rpc_timeout_seconds,
         }
+        if "refit_checkpoint_max_size_gb" in self._config:
+            init_info["refit_checkpoint_max_size_gb"] = self._config["refit_checkpoint_max_size_gb"]
 
         self._rank_zero_call(
             lambda: ray.get(
