@@ -186,7 +186,7 @@ class UpdateWeightFromModelExpress:
     def update_weights(self) -> None:
         """Capture the initial base or publish and install one policy update."""
         if not self._baseline_captured:
-            self._trainer.prepare_delta_base(hf_tensor_iter=self._iter_hf_buckets())
+            self._trainer.prepare_delta_base(tensor_iter=self._iter_hf_buckets())
             self._baseline_captured = True
             return
 
@@ -241,7 +241,7 @@ class UpdateWeightFromModelExpress:
         """Stage a version, publish its artifacts, and mark it READY."""
         staged = self._trainer.stage_shard(
             version=version,
-            hf_tensor_iter=self._iter_hf_buckets(),
+            tensor_iter=self._iter_hf_buckets(),
         )
 
         staged.publish()

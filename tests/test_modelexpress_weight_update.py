@@ -155,11 +155,11 @@ class FakeTrainer:
             "publish_object_storage_time": 8.0,
         }
 
-    def prepare_delta_base(self, *, hf_tensor_iter):
-        self.baselines.append(list(hf_tensor_iter))
+    def prepare_delta_base(self, *, tensor_iter):
+        self.baselines.append(list(tensor_iter))
 
-    def stage_shard(self, *, version, hf_tensor_iter):
-        buckets = list(hf_tensor_iter)
+    def stage_shard(self, *, version, tensor_iter):
+        buckets = list(tensor_iter)
         self.stages.append((version.version_id, buckets))
         return FakeStaged(self, version.version_id, buckets)
 
